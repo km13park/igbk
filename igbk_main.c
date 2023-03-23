@@ -1,6 +1,7 @@
 /* dummy.c: a dummy net-driver */
 
 #include <linux/module.h>
+#include <linux/types.h>
 #include <linux/kernel.h>
 #include <linux/netdevice.h>
 #include <linux/etherdevice.h>
@@ -10,6 +11,9 @@
 #include <linux/net_tstamp.h>
 #include <net/rtnetlink.h>
 #include <linux/u64_stats_sync.h>
+#include <linux/ethtool.h>
+#include <linux/pci.h>
+#include "igbk.h"
 
 /* Protocol specific headers */
 #include <linux/ip.h>
@@ -22,13 +26,11 @@
 #undef pr_fmt
 #define pr_fmt(fmt)	DRV_NAME ": " fmt
 
-#define PRIV_BUF_LEN	128
+#define PRIV_BUF_LEN		128
+#define IGB_VENDOR_ID		0x8086
+#define IGB_DEVICE_ID		0x10C9
 
-/* Exported APIs from dummy HW module */
-extern int lt_hw_tx(struct sk_buff *skb);
-extern int32_t lt_request_irq(bool mode, int32_t (*dummy_rx)(struct sk_buff *));
-
-struct dummy_priv {
+struct igbk_priv {
 	uint32_t unVersion;
 	void *buffer;
 	uint32_t buf_len;
@@ -40,7 +42,13 @@ struct pcpu_dstats {
 	struct u64_stats_sync syncp;
 };
 
-int32_t dummy_eth_rx(struct sk_buff *skb)
+static const struct pci_device_id igbk_pci_tbl[] = {
+    {PCI_DEVICE(IGB_VENDOR_ID, IGB_DEVICE_ID)},
+    {0,},
+};
+MODULE_DEVICE_TABLE(pci, igbk_pci_tbl);
+
+int32_t igbk_eth_rx(struct sk_buff *skb)
 {
 	struct iphdr *iph = NULL;
 	struct icmphdr *icmph = NULL;
@@ -94,7 +102,8 @@ free:
 	return 0;
 }
 
-static netdev_tx_t dummy_xmit(struct sk_buff *skb, struct net_device *dev)
+static void igbk_tx(struct sk_buff *skb);
+static netdev_tx_t igbk_xmit(struct sk_buff *skb, struct net_device *dev)
 {
 	struct pcpu_dstats *dstats = this_cpu_ptr(dev->dstats);
 
@@ -106,16 +115,16 @@ static netdev_tx_t dummy_xmit(struct sk_buff *skb, struct net_device *dev)
 
 	skb_tx_timestamp(skb);
 
-	/* Call HW xmit function */
-	if (lt_hw_tx(skb))
-		dev_kfree_skb(skb);
+	/* TODO: implement igbk_tx function */
+	//if (igbk_tx(skb))
+	//	dev_kfree_skb(skb);
 
 	return NETDEV_TX_OK;
 }
 
-static int dummy_dev_init(struct net_device *dev)
+static int igbk_dev_init(struct net_device *dev)
 {
-	struct dummy_priv *priv = netdev_priv(dev);
+	struct igbk_priv *priv = netdev_priv(dev);
 
 	printk(KERN_ERR "DETH: %s() - called\n", __func__);
 	dev->dstats = netdev_alloc_pcpu_stats(struct pcpu_dstats);
@@ -129,13 +138,13 @@ static int dummy_dev_init(struct net_device *dev)
 	return 0;
 }
 
-static void dummy_dev_uninit(struct net_device *dev)
+static void igbk_dev_uninit(struct net_device *dev)
 {
 	printk(KERN_ERR "DETH: %s() - called\n", __func__);
 	free_percpu(dev->dstats);
 }
 
-static int dummy_change_carrier(struct net_device *dev, bool new_carrier)
+static int igbk_change_carrier(struct net_device *dev, bool new_carrier)
 {
 	printk(KERN_ERR "DETH: %s() - called\n", __func__);
 	if (new_carrier)
@@ -145,15 +154,15 @@ static int dummy_change_carrier(struct net_device *dev, bool new_carrier)
 	return 0;
 }
 
-static int dummy_open(struct net_device *dev)
+static int igbk_open(struct net_device *dev)
 {
-	printk(KERN_ERR "DETH: %s() - called\n", __func__);
+	printk(KERN_ERR "KETH: %s() - called\n", __func__);
 	netif_start_queue(dev);
 
 	return 0;
 }
 
-static int dummy_close(struct net_device *dev)
+static int igbk_close(struct net_device *dev)
 {
 	printk(KERN_ERR "DETH: %s() - called\n", __func__);
 	netif_stop_queue(dev);
@@ -161,18 +170,72 @@ static int dummy_close(struct net_device *dev)
 	return 0;
 }
 
-static const struct net_device_ops dummy_netdev_ops = {
-		.ndo_init				= dummy_dev_init,
-		.ndo_uninit				= dummy_dev_uninit,
-		.ndo_start_xmit			= dummy_xmit,
+static const struct net_device_ops igbk_netdev_ops = {
+		.ndo_init				= igbk_dev_init,
+		.ndo_uninit				= igbk_dev_uninit,
+		.ndo_start_xmit			= igbk_xmit,
 		.ndo_validate_addr		= eth_validate_addr,
 		.ndo_set_mac_address	= eth_mac_addr,
-		.ndo_change_carrier		= dummy_change_carrier,
-		.ndo_open				= dummy_open,
-		.ndo_stop				= dummy_close,
+		.ndo_change_carrier		= igbk_change_carrier,
+		.ndo_open				= igbk_open,
+		.ndo_stop				= igbk_close,
 };
 
-static void dummy_get_drvinfo(struct net_device *dev,
+static int igbk_probe(struct pci_dev *pdev, const struct pci_device_id *ent)
+{
+    struct net_device *dev;
+    void __iomem *ioaddr;
+    int err;
+
+    dev = alloc_etherdev(sizeof(struct igbk_adapter));
+    if (!dev)
+        return -ENOMEM;
+
+    pci_set_drvdata(pdev, dev);
+
+    ioaddr = pci_iomap(pdev, 0, 0);
+    if (!ioaddr) {
+        err = -ENOMEM;
+        goto err_iomap;
+    }
+
+    /* Set up the device and register it with the network layer */
+    strncpy(dev->name, "eth%d", IFNAMSIZ);
+    dev->irq = pdev->irq;
+    dev->base_addr = (unsigned long)ioaddr;
+    dev->netdev_ops = &igbk_netdev_ops;
+
+    err = register_netdev(dev);
+    if (err)
+        goto err_register_netdev;
+
+    return 0;
+
+err_register_netdev:
+    iounmap(ioaddr);
+err_iomap:
+    free_netdev(dev);
+
+    return err;
+}
+
+static void igbk_remove(struct pci_dev *pdev)
+{
+    struct net_device *dev = pci_get_drvdata(pdev);
+
+    unregister_netdev(dev);
+    iounmap((void __iomem *)dev->base_addr);
+    free_netdev(dev);
+}
+
+static struct pci_driver igbk_driver = {
+    .name = "igbk",
+    .id_table = igbk_pci_tbl,
+    .probe = igbk_probe,
+    .remove = igbk_remove,
+};
+
+static void igbk_get_drvinfo(struct net_device *dev,
 							  struct ethtool_drvinfo *info)
 {
 	printk(KERN_ERR "DETH: %s() - called\n", __func__);
@@ -180,7 +243,7 @@ static void dummy_get_drvinfo(struct net_device *dev,
 	strlcpy(info->version, DRV_VERSION, sizeof(info->version));
 }
 
-static int dummy_get_ts_info(struct net_device *dev,
+static int igbk_get_ts_info(struct net_device *dev,
 							 struct ethtool_ts_info *ts_info)
 {
 	printk(KERN_ERR "DETH: %s() - called\n", __func__);
@@ -192,18 +255,18 @@ static int dummy_get_ts_info(struct net_device *dev,
 	return 0;
 }
 
-static const struct ethtool_ops dummy_ethtool_ops = {
-		.get_drvinfo = dummy_get_drvinfo,
-		.get_ts_info = dummy_get_ts_info,
+static const struct ethtool_ops igbk_ethtool_ops = {
+		.get_drvinfo = igbk_get_drvinfo,
+		.get_ts_info = igbk_get_ts_info,
 };
 
-static void dummy_setup(struct net_device *dev)
+static void igbk_setup(struct net_device *dev)
 {
 	ether_setup(dev);
 
 	/* Initialize the device structure */
-	dev->netdev_ops = &dummy_netdev_ops;
-	dev->ethtool_ops = &dummy_ethtool_ops;
+	dev->netdev_ops = &igbk_netdev_ops;
+	dev->ethtool_ops = &igbk_ethtool_ops;
 
 	/* Fill in device structure with ehternet-generic values */
 	dev->flags |= IFF_NOARP;
@@ -221,66 +284,65 @@ static void dummy_setup(struct net_device *dev)
 	dev->max_mtu = 0;
 }
 
-static struct rtnl_link_ops dummy_link_ops __read_mostly = {
+static struct rtnl_link_ops igbk_link_ops __read_mostly = {
 	.kind		= DRV_NAME,
-	.priv_size	= sizeof(struct dummy_priv),
-	.setup		= dummy_setup,
+	.priv_size	= sizeof(struct igbk_priv),
+	.setup		= igbk_setup,
 };
 
-static int __init dummy_init_one(void)
+static int __init igbk_init_one(void)
 {
 	int err;
-	struct net_device *dev_dummy;
+	struct net_device *dev_igbk;
 
-	dev_dummy = alloc_netdev(sizeof(struct dummy_priv),
-							 "deth%d", NET_NAME_ENUM, dummy_setup);
-	if (!dev_dummy)
+	dev_igbk = alloc_netdev(sizeof(struct igbk_priv),
+							 "deth%d", NET_NAME_ENUM, igbk_setup);
+	if (!dev_igbk)
 		return -ENOMEM;
 
-	dev_dummy->rtnl_link_ops = &dummy_link_ops;
-	err = register_netdevice(dev_dummy);
+	dev_igbk->rtnl_link_ops = &igbk_link_ops;
+	err = register_netdevice(dev_igbk);
 	if (err < 0)
-		goto err;
+		goto init_err;
 
-	/* True : Register, False : Deregister */
-	if ((err = lt_request_irq(true, &dummy_eth_rx)))
-		return err;
+	/* TODO: move the request_irq to open */
+	//if ((err = request_irq(pdev))
+	//	return err;
 
 	return 0;
-err:
-	free_netdev(dev_dummy);
+init_err:
+	free_netdev(dev_igbk);
 
 	return err;
 }
 
-static int __init dummy_init_module(void)
+static int __init igbk_init_module(void)
 {
 	int err = 0;
 
-	printk("Dummy eth module init\n");
+	printk("igbk eth module init\n");
 
 	rtnl_lock();
-	err = __rtnl_link_register(&dummy_link_ops);
+	err = __rtnl_link_register(&igbk_link_ops);
 	if (err < 0)
 		goto out;
-	err = dummy_init_one();
+	err = igbk_init_one();
 	if (err < 0)
-		__rtnl_link_unregister(&dummy_link_ops);
+		__rtnl_link_unregister(&igbk_link_ops);
 out:
 	rtnl_unlock();
 
 	return err;
 }
 
-static void __exit dummy_cleanup_module(void)
+static void __exit igbk_cleanup_module(void)
 {
-	printk("Dummy eth module exit\n");
-	 __rtnl_link_unregister(&dummy_link_ops);
+	printk("igbk eth module exit\n");
+	 __rtnl_link_unregister(&igbk_link_ops);
 }
 
-module_init(dummy_init_module);
-module_exit(dummy_cleanup_module);
+module_init(igbk_init_module);
+module_exit(igbk_cleanup_module);
 MODULE_LICENSE("GPL");
 MODULE_ALIAS_RTNL_LINK(DRV_NAME);
 MODULE_VERSION(DRV_VERSION);
-MODULE_AUTHOR(DRV_AUTHOR);
