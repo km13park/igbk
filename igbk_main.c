@@ -13,6 +13,7 @@
 #include <linux/u64_stats_sync.h>
 #include <linux/ethtool.h>
 #include <linux/pci.h>
+#include <linux/aer.h>
 #include "igbk.h"
 
 /* Protocol specific headers */
@@ -30,6 +31,12 @@
 #define IGB_VENDOR_ID		0x8086
 #define IGB_DEVICE_ID		0x10C9
 
+static const struct pci_device_id igbk_pci_tbl[] = {
+    {PCI_DEVICE(IGB_VENDOR_ID, IGB_DEVICE_ID)},
+    {0,},
+};
+MODULE_DEVICE_TABLE(pci, igbk_pci_tbl);
+
 struct igbk_priv {
 	uint32_t unVersion;
 	void *buffer;
@@ -41,12 +48,6 @@ struct pcpu_dstats {
 	u64 tx_bytes;
 	struct u64_stats_sync syncp;
 };
-
-static const struct pci_device_id igbk_pci_tbl[] = {
-    {PCI_DEVICE(IGB_VENDOR_ID, IGB_DEVICE_ID)},
-    {0,},
-};
-MODULE_DEVICE_TABLE(pci, igbk_pci_tbl);
 
 int32_t igbk_eth_rx(struct sk_buff *skb)
 {
@@ -181,60 +182,6 @@ static const struct net_device_ops igbk_netdev_ops = {
 		.ndo_stop				= igbk_close,
 };
 
-static int igbk_probe(struct pci_dev *pdev, const struct pci_device_id *ent)
-{
-    struct net_device *dev;
-    void __iomem *ioaddr;
-    int err;
-
-    dev = alloc_etherdev(sizeof(struct igbk_adapter));
-    if (!dev)
-        return -ENOMEM;
-
-    pci_set_drvdata(pdev, dev);
-
-    ioaddr = pci_iomap(pdev, 0, 0);
-    if (!ioaddr) {
-        err = -ENOMEM;
-        goto err_iomap;
-    }
-
-    /* Set up the device and register it with the network layer */
-    strncpy(dev->name, "eth%d", IFNAMSIZ);
-    dev->irq = pdev->irq;
-    dev->base_addr = (unsigned long)ioaddr;
-    dev->netdev_ops = &igbk_netdev_ops;
-
-    err = register_netdev(dev);
-    if (err)
-        goto err_register_netdev;
-
-    return 0;
-
-err_register_netdev:
-    iounmap(ioaddr);
-err_iomap:
-    free_netdev(dev);
-
-    return err;
-}
-
-static void igbk_remove(struct pci_dev *pdev)
-{
-    struct net_device *dev = pci_get_drvdata(pdev);
-
-    unregister_netdev(dev);
-    iounmap((void __iomem *)dev->base_addr);
-    free_netdev(dev);
-}
-
-static struct pci_driver igbk_driver = {
-    .name = "igbk",
-    .id_table = igbk_pci_tbl,
-    .probe = igbk_probe,
-    .remove = igbk_remove,
-};
-
 static void igbk_get_drvinfo(struct net_device *dev,
 							  struct ethtool_drvinfo *info)
 {
@@ -285,36 +232,89 @@ static void igbk_setup(struct net_device *dev)
 }
 
 static struct rtnl_link_ops igbk_link_ops __read_mostly = {
-	.kind		= DRV_NAME,
-	.priv_size	= sizeof(struct igbk_priv),
-	.setup		= igbk_setup,
+        .kind           = DRV_NAME,
+        .priv_size      = sizeof(struct igbk_priv),
+        .setup          = igbk_setup,
 };
 
-static int __init igbk_init_one(void)
+static void igbk_sw_init(struct igbk_adapter *adapter) {}
+static int igbk_probe(struct pci_dev *pdev, const struct pci_device_id *ent)
 {
-	int err;
-	struct net_device *dev_igbk;
+    struct net_device *dev;
+    struct igbk_adapter *adapter;
+    void __iomem *ioaddr;
+    int err;
 
-	dev_igbk = alloc_netdev(sizeof(struct igbk_priv),
-							 "deth%d", NET_NAME_ENUM, igbk_setup);
-	if (!dev_igbk)
-		return -ENOMEM;
-
-	dev_igbk->rtnl_link_ops = &igbk_link_ops;
-	err = register_netdevice(dev_igbk);
-	if (err < 0)
-		goto init_err;
-
-	/* TODO: move the request_irq to open */
-	//if ((err = request_irq(pdev))
-	//	return err;
-
-	return 0;
-init_err:
-	free_netdev(dev_igbk);
-
+    dev = alloc_etherdev(sizeof(struct igbk_adapter));
+    if (!dev)
+        return -ENOMEM;
+    err = pci_enable_device_mem(pdev);
+    if (err)
 	return err;
+
+    err = dma_set_mask_and_coherent(&pdev->dev, DMA_BIT_MASK(64));
+    if (err) {
+	dev_err(&pdev->dev, "No usable DMA configuration, aborting\n");
+	goto err_dma;
+    }
+
+    err = pci_request_mem_regions(pdev, "igbk");
+    if (err)
+	goto err_pci_reg;
+
+    pci_enable_pcie_error_reporting(pdev);
+
+    pci_set_master(pdev);
+    pci_save_state(pdev);
+    pci_set_drvdata(pdev, dev);
+
+    adapter = netdev_priv(dev);
+    adapter->netdev = dev;
+    adapter->pdev = pdev;
+    adapter->ioaddr = pci_iomap(pdev, 0, 0);
+    if (!adapter->ioaddr) {
+        err = -ENOMEM;
+        goto err_iomap;
+    }
+
+    igbk_sw_init(adapter);
+    /* Set up the device and register it with the network layer */
+    strncpy(dev->name, "eth%d", IFNAMSIZ);
+    dev->irq = pdev->irq;
+    dev->base_addr = (unsigned long)ioaddr;
+    dev->netdev_ops = &igbk_netdev_ops;
+
+    err = register_netdev(dev);
+    if (err)
+        goto err_register_netdev;
+
+    return 0;
+
+err_register_netdev:
+    iounmap(ioaddr);
+err_iomap:
+    free_netdev(dev);
+err_pci_reg:
+err_dma:
+    pci_disable_device(pdev);
+    return err;
 }
+
+static void igbk_remove(struct pci_dev *pdev)
+{
+    struct net_device *dev = pci_get_drvdata(pdev);
+
+    unregister_netdev(dev);
+    iounmap((void __iomem *)dev->base_addr);
+    free_netdev(dev);
+}
+
+static struct pci_driver igbk_driver = {
+    .name = "igbk",
+    .id_table = igbk_pci_tbl,
+    .probe = igbk_probe,
+    .remove = igbk_remove,
+};
 
 static int __init igbk_init_module(void)
 {
@@ -322,11 +322,12 @@ static int __init igbk_init_module(void)
 
 	printk("igbk eth module init\n");
 
+	// TODO: check if we need to move this into probe function
 	rtnl_lock();
 	err = __rtnl_link_register(&igbk_link_ops);
 	if (err < 0)
 		goto out;
-	err = igbk_init_one();
+	err = pci_register_driver(&igbk_driver);
 	if (err < 0)
 		__rtnl_link_unregister(&igbk_link_ops);
 out:
