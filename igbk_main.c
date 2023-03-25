@@ -103,8 +103,9 @@ free:
 	return 0;
 }
 
-static void igbk_tx(struct sk_buff *skb);
-static int igb_init_interrupt_scheme(struct igb_adapter *adapter, bool msix);
+static void igbk_tx(struct sk_buff *skb){}
+static int igbk_init_interrupt_scheme(struct igbk_adapter *adapter, bool msix){return 0;}
+static void igbk_irq_disable(struct igbk_adapter *adapter){}
 
 static netdev_tx_t igbk_xmit(struct sk_buff *skb, struct net_device *dev)
 {
@@ -247,30 +248,41 @@ static int igbk_sw_init(struct igbk_adapter *adapter) {
 	pci_read_config_word(pdev, PCI_COMMAND, &hw->bus.pci_cmd_word);
 
 	/* set default ring sizes */
-	adapter->tx_ring_count = IGB_DEFAULT_TXD;
-	adapter->rx_ring_count = IGB_DEFAULT_RXD;
+	adapter->tx_ring_count = IGBK_DEFAULT_TXD;
+	adapter->rx_ring_count = IGBK_DEFAULT_RXD;
 
 	/* set default ITR values */
-	adapter->rx_itr_setting = IGB_DEFAULT_ITR;
-	adapter->tx_itr_setting = IGB_DEFAULT_ITR;
+	adapter->rx_itr_setting = IGBK_DEFAULT_ITR;
+	adapter->tx_itr_setting = IGBK_DEFAULT_ITR;
 
+	/* set default work limits */
+	adapter->tx_work_limit = IGBK_DEFAULT_TX_WORK;
+
+	adapter->max_frame_size = netdev->mtu + IGBK_ETH_PKT_HDR_PAD;
+	adapter->min_frame_size = ETH_ZLEN + ETH_FCS_LEN;
+
+	adapter->flags |= IGBK_FLAG_HAS_MSIX;
+
+	//TODO: do we need to populate mac_table here?
 	//TODO: rx implement
 	if (igbk_init_interrupt_scheme(adapter, true)) {
 		dev_err(&pdev->dev, "Unable to allocate memory for queues\n");
 		return -ENOMEM;
 	}
+	igbk_irq_disable(adapter);
 
 	return 0;
 }
+
 static int igbk_probe(struct pci_dev *pdev, const struct pci_device_id *ent)
 {
-	struct net_device *dev;
+	struct net_device *netdev;
 	struct igbk_adapter *adapter;
 	struct e1000_hw *hw;
 	int err;
 
-    dev = alloc_etherdev(sizeof(struct igbk_adapter));
-    if (!dev)
+    netdev = alloc_etherdev(sizeof(struct igbk_adapter));
+    if (!netdev)
         return -ENOMEM;
     err = pci_enable_device_mem(pdev);
     if (err)
@@ -290,10 +302,10 @@ static int igbk_probe(struct pci_dev *pdev, const struct pci_device_id *ent)
 
     pci_set_master(pdev);
     pci_save_state(pdev);
-    pci_set_drvdata(pdev, dev);
+    pci_set_drvdata(pdev, netdev);
 
-    adapter = netdev_priv(dev);
-    adapter->netdev = dev;
+    adapter = netdev_priv(netdev);
+    adapter->netdev = netdev;
     adapter->pdev = pdev;
 	hw = &adapter->hw;
 	hw->back = adapter;
@@ -305,21 +317,21 @@ static int igbk_probe(struct pci_dev *pdev, const struct pci_device_id *ent)
 
     err = igbk_sw_init(adapter);
     /* Set up the device and register it with the network layer */
-    strncpy(dev->name, "eth%d", IFNAMSIZ);
-    dev->irq = pdev->irq;
-    dev->base_addr = (unsigned long)ioaddr;
-    dev->netdev_ops = &igbk_netdev_ops;
+    strncpy(netdev->name, "eth%d", IFNAMSIZ);
+    netdev->irq = pdev->irq;
+    netdev->netdev_ops = &igbk_netdev_ops;
+	netdev->ethtool_ops = &igbk_ethtool_ops;
 
-    err = register_netdev(dev);
+    err = register_netdev(netdev);
     if (err)
         goto err_register_netdev;
 
     return 0;
 
 err_register_netdev:
-    iounmap(ioaddr);
+    iounmap(adapter->ioaddr);
 err_iomap:
-    free_netdev(dev);
+    free_netdev(netdev);
 err_pci_reg:
 err_dma:
     pci_disable_device(pdev);
@@ -328,11 +340,11 @@ err_dma:
 
 static void igbk_remove(struct pci_dev *pdev)
 {
-    struct net_device *dev = pci_get_drvdata(pdev);
+    struct net_device *netdev = pci_get_drvdata(pdev);
 
-    unregister_netdev(dev);
-    iounmap((void __iomem *)dev->base_addr);
-    free_netdev(dev);
+    unregister_netdev(netdev);
+    iounmap((void __iomem *)netdev->base_addr);
+    free_netdev(netdev);
 }
 
 static struct pci_driver igbk_driver = {
