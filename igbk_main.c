@@ -104,6 +104,8 @@ free:
 }
 
 static void igbk_tx(struct sk_buff *skb);
+static int igb_init_interrupt_scheme(struct igb_adapter *adapter, bool msix);
+
 static netdev_tx_t igbk_xmit(struct sk_buff *skb, struct net_device *dev)
 {
 	struct pcpu_dstats *dstats = this_cpu_ptr(dev->dstats);
@@ -237,13 +239,35 @@ static struct rtnl_link_ops igbk_link_ops __read_mostly = {
         .setup          = igbk_setup,
 };
 
-static void igbk_sw_init(struct igbk_adapter *adapter) {}
+static int igbk_sw_init(struct igbk_adapter *adapter) {
+	struct net_device *netdev = adapter->netdev;
+	struct pci_dev *pdev = adapter->pdev;
+	struct e1000_hw *hw = &adapter->hw;
+
+	pci_read_config_word(pdev, PCI_COMMAND, &hw->bus.pci_cmd_word);
+
+	/* set default ring sizes */
+	adapter->tx_ring_count = IGB_DEFAULT_TXD;
+	adapter->rx_ring_count = IGB_DEFAULT_RXD;
+
+	/* set default ITR values */
+	adapter->rx_itr_setting = IGB_DEFAULT_ITR;
+	adapter->tx_itr_setting = IGB_DEFAULT_ITR;
+
+	//TODO: rx implement
+	if (igbk_init_interrupt_scheme(adapter, true)) {
+		dev_err(&pdev->dev, "Unable to allocate memory for queues\n");
+		return -ENOMEM;
+	}
+
+	return 0;
+}
 static int igbk_probe(struct pci_dev *pdev, const struct pci_device_id *ent)
 {
-    struct net_device *dev;
-    struct igbk_adapter *adapter;
-    void __iomem *ioaddr;
-    int err;
+	struct net_device *dev;
+	struct igbk_adapter *adapter;
+	struct e1000_hw *hw;
+	int err;
 
     dev = alloc_etherdev(sizeof(struct igbk_adapter));
     if (!dev)
@@ -260,7 +284,7 @@ static int igbk_probe(struct pci_dev *pdev, const struct pci_device_id *ent)
 
     err = pci_request_mem_regions(pdev, "igbk");
     if (err)
-	goto err_pci_reg;
+		goto err_pci_reg;
 
     pci_enable_pcie_error_reporting(pdev);
 
@@ -271,13 +295,15 @@ static int igbk_probe(struct pci_dev *pdev, const struct pci_device_id *ent)
     adapter = netdev_priv(dev);
     adapter->netdev = dev;
     adapter->pdev = pdev;
+	hw = &adapter->hw;
+	hw->back = adapter;
     adapter->ioaddr = pci_iomap(pdev, 0, 0);
     if (!adapter->ioaddr) {
         err = -ENOMEM;
         goto err_iomap;
     }
 
-    igbk_sw_init(adapter);
+    err = igbk_sw_init(adapter);
     /* Set up the device and register it with the network layer */
     strncpy(dev->name, "eth%d", IFNAMSIZ);
     dev->irq = pdev->irq;
