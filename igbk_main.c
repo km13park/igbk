@@ -32,8 +32,8 @@
 #define IGB_DEVICE_ID		0x10C9
 
 static const struct pci_device_id igbk_pci_tbl[] = {
-    {PCI_DEVICE(IGB_VENDOR_ID, IGB_DEVICE_ID)},
-    {0,},
+	{PCI_DEVICE(IGB_VENDOR_ID, IGB_DEVICE_ID)},
+	{0,},
 };
 MODULE_DEVICE_TABLE(pci, igbk_pci_tbl);
 
@@ -235,9 +235,9 @@ static void igbk_setup(struct net_device *dev)
 }
 
 static struct rtnl_link_ops igbk_link_ops __read_mostly = {
-        .kind           = DRV_NAME,
-        .priv_size      = sizeof(struct igbk_priv),
-        .setup          = igbk_setup,
+		.kind			= DRV_NAME,
+		.priv_size		= sizeof(struct igbk_priv),
+		.setup			= igbk_setup,
 };
 
 static int igbk_sw_init(struct igbk_adapter *adapter) {
@@ -281,77 +281,79 @@ static int igbk_probe(struct pci_dev *pdev, const struct pci_device_id *ent)
 	struct e1000_hw *hw;
 	int err;
 
-    netdev = alloc_etherdev(sizeof(struct igbk_adapter));
-    if (!netdev)
-        return -ENOMEM;
-    err = pci_enable_device_mem(pdev);
-    if (err)
-	return err;
+	netdev = alloc_etherdev(sizeof(struct igbk_adapter));
+	if (!netdev)
+		return -ENOMEM;
+	err = pci_enable_device_mem(pdev);
+	if (err)
+		return err;
 
-    err = dma_set_mask_and_coherent(&pdev->dev, DMA_BIT_MASK(64));
-    if (err) {
-	dev_err(&pdev->dev, "No usable DMA configuration, aborting\n");
-	goto err_dma;
-    }
+	err = dma_set_mask_and_coherent(&pdev->dev, DMA_BIT_MASK(64));
+	if (err) {
+		dev_err(&pdev->dev, "No usable DMA configuration, aborting\n");
+		goto err_dma;
+	}
 
-    err = pci_request_mem_regions(pdev, "igbk");
-    if (err)
+	err = pci_request_mem_regions(pdev, "igbk");
+	if (err)
 		goto err_pci_reg;
 
-    pci_enable_pcie_error_reporting(pdev);
+	pci_enable_pcie_error_reporting(pdev);
 
-    pci_set_master(pdev);
-    pci_save_state(pdev);
-    pci_set_drvdata(pdev, netdev);
+	pci_set_master(pdev);
+	pci_save_state(pdev);
+	pci_set_drvdata(pdev, netdev);
 
-    adapter = netdev_priv(netdev);
-    adapter->netdev = netdev;
-    adapter->pdev = pdev;
+	adapter = netdev_priv(netdev);
+	adapter->netdev = netdev;
+	adapter->pdev = pdev;
 	hw = &adapter->hw;
 	hw->back = adapter;
-    adapter->ioaddr = pci_iomap(pdev, 0, 0);
-    if (!adapter->ioaddr) {
-        err = -ENOMEM;
-        goto err_iomap;
-    }
+	adapter->ioaddr = pci_iomap(pdev, 0, 0);
+	if (!adapter->ioaddr) {
+		err = -ENOMEM;
+		goto err_iomap;
+	}
 
-    err = igbk_sw_init(adapter);
-    /* Set up the device and register it with the network layer */
-    strncpy(netdev->name, "eth%d", IFNAMSIZ);
-    netdev->irq = pdev->irq;
-    netdev->netdev_ops = &igbk_netdev_ops;
+	err = igbk_sw_init(adapter);
+	/* Set up the device and register it with the network layer */
+	strncpy(netdev->name, "eth%d", IFNAMSIZ);
+	netdev->irq = pdev->irq;
+	netdev->netdev_ops = &igbk_netdev_ops;
 	netdev->ethtool_ops = &igbk_ethtool_ops;
 
-    err = register_netdev(netdev);
-    if (err)
-        goto err_register_netdev;
+	//TODO
+	igbk_setup(netdev);
+	err = register_netdev(netdev);
+	if (err)
+		goto err_register_netdev;
 
-    return 0;
+	return 0;
 
 err_register_netdev:
-    iounmap(adapter->ioaddr);
+		iounmap(adapter->ioaddr);
 err_iomap:
-    free_netdev(netdev);
+		free_netdev(netdev);
 err_pci_reg:
 err_dma:
-    pci_disable_device(pdev);
-    return err;
+		pci_disable_device(pdev);
+		return err;
 }
 
 static void igbk_remove(struct pci_dev *pdev)
 {
-    struct net_device *netdev = pci_get_drvdata(pdev);
+	struct net_device *netdev = pci_get_drvdata(pdev);
 
-    unregister_netdev(netdev);
-    iounmap((void __iomem *)netdev->base_addr);
-    free_netdev(netdev);
-}
+	unregister_netdev(netdev);
+	iounmap((void __iomem *)netdev->base_addr);
+	free_netdev(netdev);
+	}
 
 static struct pci_driver igbk_driver = {
-    .name = "igbk",
-    .id_table = igbk_pci_tbl,
-    .probe = igbk_probe,
-    .remove = igbk_remove,
+	.name = "igbk",
+	.id_table = igbk_pci_tbl,
+	.probe = igbk_probe,
+	.remove = igbk_remove,
 };
 
 static int __init igbk_init_module(void)

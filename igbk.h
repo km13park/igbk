@@ -2,6 +2,7 @@
 #include <linux/if_vlan.h>
 
 #define MAX_MSIX_ENTRIES 10
+#define MAX_Q_VECTORS		8
 
 enum e1000_bus_type {
 	e1000_bus_type_unknown = 0,
@@ -81,11 +82,11 @@ struct igbk_adapter {
     u16 tx_work_limit;
     u32 tx_timeout_count;
     int num_tx_queues;
-    struct igb_ring *tx_ring[16];
+    struct igbk_ring *tx_ring[16];
 
     /* RX */
     int num_rx_queues;
-    struct igb_ring *rx_ring[16];
+    struct igbk_ring *rx_ring[16];
 
 	u16 tx_ring_count;
 	u16 rx_ring_count;
@@ -93,6 +94,7 @@ struct igbk_adapter {
 	u32 max_frame_size;
 	u32 min_frame_size;
 
+	struct igbk_q_vector *q_vector[MAX_Q_VECTORS];
 	struct e1000_hw hw;
 };
 
@@ -103,3 +105,94 @@ struct igbk_adapter {
 #define IGBK_DEFAULT_TX_WORK	128
 #define IGBK_ETH_PKT_HDR_PAD	(ETH_HLEN + ETH_FCS_LEN + (VLAN_HLEN * 2))
 #define IGBK_FLAG_HAS_MSIX		BIT(13)
+#define MAX_MSIX_ENTRIES	10
+
+struct igbk_tx_queue_stats {
+	u64 packets;
+	u64 bytes;
+	u64 restart_queue;
+	u64 restart_queue2;
+};
+
+struct igbk_rx_queue_stats {
+	u64 packets;
+	u64 bytes;
+	u64 drops;
+	u64 csum_err;
+	u64 alloc_failed;
+};
+
+struct igbk_ring {
+	struct igbk_q_vector *q_vector;	/* backlink to q_vector */
+	struct net_device *netdev;	/* back pointer to net_device */
+	struct bpf_prog *xdp_prog;
+	struct device *dev;		/* device pointer for dma mapping */
+	union {				/* array of buffer info structs */
+		struct igbk_tx_buffer *tx_buffer_info;
+		struct igbk_rx_buffer *rx_buffer_info;
+	};
+	void *desc;			/* descriptor ring memory */
+	unsigned long flags;		/* ring specific flags */
+	void __iomem *tail;		/* pointer to ring tail register */
+	dma_addr_t dma;			/* phys address of the ring */
+	unsigned int  size;		/* length of desc. ring in bytes */
+
+	u16 count;			/* number of desc. in the ring */
+	u8 queue_index;			/* logical index of the ring*/
+	u8 reg_idx;			/* physical index of the ring */
+	bool launchtime_enable;		/* true if LaunchTime is enabled */
+	bool cbs_enable;		/* indicates if CBS is enabled */
+	s32 idleslope;			/* idleSlope in kbps */
+	s32 sendslope;			/* sendSlope in kbps */
+	s32 hicredit;			/* hiCredit in bytes */
+	s32 locredit;			/* loCredit in bytes */
+
+	/* everything past this point are written often */
+	u16 next_to_clean;
+	u16 next_to_use;
+	u16 next_to_alloc;
+
+	union {
+		/* TX */
+		struct {
+			struct igbk_tx_queue_stats tx_stats;
+			struct u64_stats_sync tx_syncp;
+			struct u64_stats_sync tx_syncp2;
+		};
+		/* RX */
+		struct {
+			struct sk_buff *skb;
+			struct igbk_rx_queue_stats rx_stats;
+			struct u64_stats_sync rx_syncp;
+		};
+	};
+	struct xdp_rxq_info xdp_rxq;
+} ____cacheline_internodealigned_in_smp;
+
+struct igbk_ring_container {
+	struct igb_ring *ring;		/* pointer to linked list of rings */
+	unsigned int total_bytes;	/* total bytes processed this int */
+	unsigned int total_packets;	/* total packets processed this int */
+	u16 work_limit;			/* total work allowed per interrupt */
+	u8 count;			/* total number of rings in vector */
+	u8 itr;				/* current ITR setting for ring */
+};
+
+struct igbk_q_vector {
+	struct igbk_adapter *adapter;	/* backlink */
+	int cpu;			/* CPU for DCA */
+	u32 eims_value;			/* EIMS mask value */
+
+	u16 itr_val;
+	u8 set_itr;
+	void __iomem *itr_register;
+
+	struct igbk_ring_container rx, tx;
+
+	struct napi_struct napi;
+	struct rcu_head rcu;	/* to avoid race with update stats on free */
+	char name[IFNAMSIZ + 9];
+
+	/* for dynamic allocation of rings associated with this q_vector */
+	struct igbk_ring ring[] ____cacheline_internodealigned_in_smp;
+};
