@@ -234,12 +234,6 @@ static void igbk_setup(struct net_device *dev)
 	dev->max_mtu = 0;
 }
 
-static struct rtnl_link_ops igbk_link_ops __read_mostly = {
-		.kind			= DRV_NAME,
-		.priv_size		= sizeof(struct igbk_priv),
-		.setup			= igbk_setup,
-};
-
 static int igbk_sw_init(struct igbk_adapter *adapter) {
 	struct net_device *netdev = adapter->netdev;
 	struct pci_dev *pdev = adapter->pdev;
@@ -361,17 +355,7 @@ static int __init igbk_init_module(void)
 	int err = 0;
 
 	printk("igbk eth module init\n");
-
-	// TODO: check if we need to move this into probe function
-	rtnl_lock();
-	err = __rtnl_link_register(&igbk_link_ops);
-	if (err < 0)
-		goto out;
 	err = pci_register_driver(&igbk_driver);
-	if (err < 0)
-		__rtnl_link_unregister(&igbk_link_ops);
-out:
-	rtnl_unlock();
 
 	return err;
 }
@@ -379,7 +363,7 @@ out:
 static void __exit igbk_cleanup_module(void)
 {
 	printk("igbk eth module exit\n");
-	 __rtnl_link_unregister(&igbk_link_ops);
+	pci_unregister_driver(&igbk_driver);
 }
 
 module_init(igbk_init_module);
