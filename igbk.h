@@ -62,6 +62,36 @@ struct e1000_hw {
 	u8  revision_id;
 };
 
+/* Transmit Descriptor - Advanced */
+union e1000_adv_tx_desc {
+	struct {
+		__le64 buffer_addr;    /* Address of descriptor's data buf */
+		__le32 cmd_type_len;
+		__le32 olinfo_status;
+	} read;
+	struct {
+		__le64 rsvd;       /* Reserved */
+		__le32 nxtseq_seed;
+		__le32 status;e1000_adv_tx_desc
+	} wb;
+};
+
+/* wrapper around a pointer to a socket buffer,
+ * so a DMA handle can be stored along with the buffer
+ */
+struct igb_tx_buffer {
+	union  *next_to_watch;
+	unsigned long time_stamp;
+	struct sk_buff *skb;
+	unsigned int bytecount;
+	u16 gso_segs;
+	__be16 protocol;
+
+	//DEFINE_DMA_UNMAP_ADDR(dma);
+	//DEFINE_DMA_UNMAP_LEN(len);
+	u32 tx_flags;
+};
+
 /* HW board specific private data structure */
 struct igbk_adapter {
     struct net_device *netdev;

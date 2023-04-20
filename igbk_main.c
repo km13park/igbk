@@ -31,6 +31,75 @@
 #define IGB_VENDOR_ID		0x8086
 #define IGB_DEVICE_ID		0x10C9
 
+netdev_tx_t igbk_xmit_frame_ring(struct sk_buff *skb, struct igbk_ring *tx_ring)
+{
+	struct igbk_tx_buffer *first;
+	int tso;
+	u32 tx_flags = 0;
+	unsigned short f;
+	u16 count = TXD_USE_COUNT(skb_headlen(skb));
+	__be16 protocol = vlan_get_protocol(skb);
+	u8 hdr_len = 0;
+
+	/* need: 1 descriptor per page * PAGE_SIZE/IGB_MAX_DATA_PER_TXD,
+	 *       + 1 desc for skb_headlen/IGB_MAX_DATA_PER_TXD,
+	 *       + 2 desc gap to keep tail from touching head,
+	 *       + 1 desc for context descriptor,
+	 * otherwise try next time
+	 */
+	for (f = 0; f < skb_shinfo(skb)->nr_frags; f++)
+		count += TXD_USE_COUNT(skb_frag_size(
+						&skb_shinfo(skb)->frags[f]));
+
+	/* record the location of the first descriptor for this packet */
+	first = &tx_ring->tx_buffer_info[tx_ring->next_to_use];
+	first->type = IGB_TYPE_SKB;
+	first->skb = skb;
+	first->bytecount = skb->len;
+	first->gso_segs = 1;
+
+	/* record initial flags and protocol */
+	first->tx_flags = tx_flags;
+	first->protocol = protocol;
+
+	tso = igbk_tso(tx_ring, first, &hdr_len);
+	if (tso < 0)
+		goto out_drop;
+	else if (!tso)
+		igbk_tx_csum(tx_ring, first);
+
+	if (igbk_tx_map(tx_ring, first, hdr_len))
+		goto cleanup_tx_tstamp;
+
+	return NETDEV_TX_OK;
+
+out_drop:
+	dev_kfree_skb_any(first->skb);
+	first->skb = NULL;
+cleanup_tx_tstamp:
+	if (unlikely(tx_flags & IGB_TX_FLAGS_TSTAMP)) {
+		struct igbk_adapter *adapter = netdev_priv(tx_ring->netdev);
+
+		dev_kfree_skb_any(adapter->ptp_tx_skb);
+		adapter->ptp_tx_skb = NULL;
+		if (adapter->hw.mac.type == e1000_82576)
+			cancel_work_sync(&adapter->ptp_tx_work);
+		clear_bit_unlock(__IGB_PTP_TX_IN_PROGRESS, &adapter->state);
+	}
+
+	return NETDEV_TX_OK;
+}
+
+static netdev_tx_t igbk_xmit_frame(struct sk_buff *skb, struct net_device *netdev)
+{
+	struct igbk_adapter *adapter = netdev_priv(netdev);
+	unsigned int r_idx = skb->queue_mapping;
+
+	if (r_idx >= adapter->num_tx_queues)
+		r_idx = r_idx % adapter->num_tx_queues;
+	return igbk_xmit_frame_ring(skb, adapter->tx_ring[r_idx]);
+}
+
 static const struct pci_device_id igbk_pci_tbl[] = {
 	{PCI_DEVICE(IGB_VENDOR_ID, IGB_DEVICE_ID)},
 	{0,},
@@ -177,7 +246,7 @@ static int igbk_close(struct net_device *dev)
 static const struct net_device_ops igbk_netdev_ops = {
 		.ndo_init				= igbk_dev_init,
 		.ndo_uninit				= igbk_dev_uninit,
-		.ndo_start_xmit			= igbk_xmit,
+		.ndo_start_xmit			= igbk_xmit_frame,
 		.ndo_validate_addr		= eth_validate_addr,
 		.ndo_set_mac_address	= eth_mac_addr,
 		.ndo_change_carrier		= igbk_change_carrier,
@@ -218,6 +287,7 @@ static void igbk_setup(struct net_device *dev)
 	dev->netdev_ops = &igbk_netdev_ops;
 	dev->ethtool_ops = &igbk_ethtool_ops;
 
+	/* TODO: do we still need a netif here?
 	/* Fill in device structure with ehternet-generic values */
 	dev->flags |= IFF_NOARP;
 	dev->flags &= ~IFF_MULTICAST;
@@ -230,8 +300,8 @@ static void igbk_setup(struct net_device *dev)
 	dev->hw_enc_features |= dev->features;
 	eth_hw_addr_random(dev);
 
-	dev->min_mtu = 0;
-	dev->max_mtu = 0;
+	dev->min_mtu = ETH_MIN_MTU;;
+	dev->max_mtu = MAX_STD_JUMBO_FRAME_SIZE;
 }
 
 static int igbk_sw_init(struct igbk_adapter *adapter) {
@@ -316,7 +386,6 @@ static int igbk_probe(struct pci_dev *pdev, const struct pci_device_id *ent)
 	netdev->netdev_ops = &igbk_netdev_ops;
 	netdev->ethtool_ops = &igbk_ethtool_ops;
 
-	//TODO
 	igbk_setup(netdev);
 	err = register_netdev(netdev);
 	if (err)
@@ -341,7 +410,7 @@ static void igbk_remove(struct pci_dev *pdev)
 	unregister_netdev(netdev);
 	iounmap((void __iomem *)netdev->base_addr);
 	free_netdev(netdev);
-	}
+}
 
 static struct pci_driver igbk_driver = {
 	.name = "igbk",
