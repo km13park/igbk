@@ -31,6 +31,510 @@
 #define IGB_VENDOR_ID		0x8086
 #define IGB_DEVICE_ID		0x10C9
 
+static void igbk_ring_irq_enable(struct igbk_q_vector *q_vector)
+{
+	struct igbk_adapter *adapter = q_vector->adapter;
+	struct e1000_hw *hw = &adapter->hw;
+
+	/* TODO: set the ITR (interrupt throttle rate) here */
+
+	if (!test_bit(__IGB_DOWN, &adapter->state)) {
+		wr32(E1000_EIMS, q_vector->eims_value);
+	}
+}
+
+static bool igbk_clean_tx_irq(struct igbk_q_vector *q_vector, int napi_budget)
+{
+	struct igbk_adapter *adapter = q_vector->adapter;
+	struct igbk_ring *tx_ring = q_vector->tx.ring;
+	struct igbk_tx_buffer *tx_buffer;
+	union e1000_adv_tx_desc *tx_desc;
+	unsigned int total_bytes = 0, total_packets = 0;
+	unsigned int budget = q_vector->tx.work_limit;
+	unsigned int i = tx_ring->next_to_clean;
+
+	if (test_bit(__IGB_DOWN, &adapter->state))
+		return true;
+
+	tx_buffer = &tx_ring->tx_buffer_info[i];
+	tx_desc = IGB_TX_DESC(tx_ring, i);
+	i -= tx_ring->count;
+
+	do {
+		union e1000_adv_tx_desc *eop_desc = tx_buffer->next_to_watch;
+
+		/* if next_to_watch is not set then there is no work pending */
+		if (!eop_desc)
+			break;
+
+		/* prevent any other reads prior to eop_desc */
+		smp_rmb();
+
+		/* if DD is not set pending work has not been completed */
+		if (!(eop_desc->wb.status & cpu_to_le32(E1000_TXD_STAT_DD)))
+			break;
+
+		/* clear next_to_watch to prevent false hangs */
+		tx_buffer->next_to_watch = NULL;
+
+		/* update the statistics for this packet */
+		total_bytes += tx_buffer->bytecount;
+		total_packets += tx_buffer->gso_segs;
+
+		/* free the skb */
+		if (tx_buffer->type == IGB_TYPE_SKB)
+			napi_consume_skb(tx_buffer->skb, napi_budget);
+		else
+			xdp_return_frame(tx_buffer->xdpf);
+
+		/* unmap skb header data */
+		dma_unmap_single(tx_ring->dev,
+				 dma_unmap_addr(tx_buffer, dma),
+				 dma_unmap_len(tx_buffer, len),
+				 DMA_TO_DEVICE);
+
+		/* clear tx_buffer data */
+		dma_unmap_len_set(tx_buffer, len, 0);
+
+		/* clear last DMA location and unmap remaining buffers */
+		while (tx_desc != eop_desc) {
+			tx_buffer++;
+			tx_desc++;
+			i++;
+			if (unlikely(!i)) {
+				i -= tx_ring->count;
+				tx_buffer = tx_ring->tx_buffer_info;
+				tx_desc = IGB_TX_DESC(tx_ring, 0);
+			}
+
+			/* unmap any remaining paged data */
+			if (dma_unmap_len(tx_buffer, len)) {
+				dma_unmap_page(tx_ring->dev,
+					       dma_unmap_addr(tx_buffer, dma),
+					       dma_unmap_len(tx_buffer, len),
+					       DMA_TO_DEVICE);
+				dma_unmap_len_set(tx_buffer, len, 0);
+			}
+		}
+
+		/* move us one more past the eop_desc for start of next pkt */
+		tx_buffer++;
+		tx_desc++;
+		i++;
+		if (unlikely(!i)) {
+			i -= tx_ring->count;
+			tx_buffer = tx_ring->tx_buffer_info;
+			tx_desc = IGB_TX_DESC(tx_ring, 0);
+		}
+
+		/* issue prefetch for next Tx descriptor */
+		prefetch(tx_desc);
+
+		/* update budget accounting */
+		budget--;
+	} while (likely(budget));
+
+	netdev_tx_completed_queue(txring_txq(tx_ring),
+				  total_packets, total_bytes);
+	i += tx_ring->count;
+	tx_ring->next_to_clean = i;
+	u64_stats_update_begin(&tx_ring->tx_syncp);
+	tx_ring->tx_stats.bytes += total_bytes;
+	tx_ring->tx_stats.packets += total_packets;
+	u64_stats_update_end(&tx_ring->tx_syncp);
+	q_vector->tx.total_bytes += total_bytes;
+	q_vector->tx.total_packets += total_packets;
+
+#define TX_WAKE_THRESHOLD (DESC_NEEDED * 2)
+	if (unlikely(total_packets &&
+	    netif_carrier_ok(tx_ring->netdev) &&
+	    igbk_desc_unused(tx_ring) >= TX_WAKE_THRESHOLD)) {
+		/* Make sure that anybody stopping the queue after this
+		 * sees the new next_to_clean.
+		 */
+		smp_mb();
+		if (__netif_subqueue_stopped(tx_ring->netdev,
+					     tx_ring->queue_index) &&
+		    !(test_bit(__IGBK_DOWN, &adapter->state))) {
+			netif_wake_subqueue(tx_ring->netdev,
+					    tx_ring->queue_index);
+
+			u64_stats_update_begin(&tx_ring->tx_syncp);
+			tx_ring->tx_stats.restart_queue++;
+			u64_stats_update_end(&tx_ring->tx_syncp);
+		}
+	}
+
+	return !!budget;
+}
+
+static int igbk_poll(struct napi_struct *napi, int budget)
+{
+	struct igbk_q_vector *q_vector = container_of(napi,
+						     struct igb_q_vector,
+						     napi);
+	bool clean_complete = true;
+	int work_done = 0;
+
+	if (q_vector->tx.ring)
+		clean_complete = igbk_clean_tx_irq(q_vector, budget);
+
+	if (q_vector->rx.ring) {
+		int cleaned = igbk_clean_rx_irq(q_vector, budget);
+
+		work_done += cleaned;
+		if (cleaned >= budget)
+			clean_complete = false;
+	}
+
+	/* If all work not completed, return budget and keep polling */
+	if (!clean_complete)
+		return budget;
+
+	/* Exit the polling mode, but don't re-enable interrupts if stack might
+	 * poll us due to busy-polling
+	 */
+	if (likely(napi_complete_done(napi, work_done)))
+		igbk_ring_irq_enable(q_vector);
+
+	return work_done;
+}
+
+static void igbk_add_ring(struct igbk_ring *ring,
+			 struct igbk_ring_container *head)
+{
+	head->ring = ring;
+	head->count++;
+}
+
+static int igbk_alloc_q_vector(struct igbk_adapter *adapter,
+			      int v_count, int v_idx,
+			      int txr_count, int txr_idx,
+			      int rxr_count, int rxr_idx)
+{
+	struct igbk_q_vector *q_vector;
+	struct igbk_ring *ring;
+	int ring_count;
+	size_t size;
+
+	/* igb only supports 1 Tx and/or 1 Rx queue per vector */
+	if (txr_count > 1 || rxr_count > 1)
+		return -ENOMEM;
+
+	ring_count = txr_count + rxr_count;
+	size = kmalloc_size_roundup(struct_size(q_vector, ring, ring_count));
+
+	/* allocate q_vector and rings */
+	q_vector = adapter->q_vector[v_idx];
+	if (!q_vector) {
+		q_vector = kzalloc(size, GFP_KERNEL);
+	} else if (size > ksize(q_vector)) {
+		struct igbk_q_vector *new_q_vector;
+
+		new_q_vector = kzalloc(size, GFP_KERNEL);
+		if (new_q_vector)
+			kfree_rcu(q_vector, rcu);
+		q_vector = new_q_vector;
+	} else {
+		memset(q_vector, 0, size);
+	}
+	if (!q_vector)
+		return -ENOMEM;
+
+	/* initialize NAPI */
+	netif_napi_add(adapter->netdev, &q_vector->napi, igbk_poll);
+
+	/* tie q_vector and adapter together */
+	adapter->q_vector[v_idx] = q_vector;
+	q_vector->adapter = adapter;
+
+	/* initialize work limits */
+	q_vector->tx.work_limit = adapter->tx_work_limit;
+
+	/* initialize ITR configuration */
+	q_vector->itr_register = adapter->io_addr + E1000_EITR(0);
+	q_vector->itr_val = IGB_START_ITR;
+
+	/* initialize pointer to rings */
+	ring = q_vector->ring;
+
+	/* intialize ITR */
+	if (rxr_count) {
+		/* rx or rx/tx vector */
+		if (!adapter->rx_itr_setting || adapter->rx_itr_setting > 3)
+			q_vector->itr_val = adapter->rx_itr_setting;
+	} else {
+		/* tx only vector */
+		if (!adapter->tx_itr_setting || adapter->tx_itr_setting > 3)
+			q_vector->itr_val = adapter->tx_itr_setting;
+	}
+
+	if (txr_count) {
+		/* assign generic ring traits */
+		ring->dev = &adapter->pdev->dev;
+		ring->netdev = adapter->netdev;
+
+		/* configure backlink on ring */
+		ring->q_vector = q_vector;
+
+		/* update q_vector Tx values */
+		igbk_add_ring(ring, &q_vector->tx);
+
+		/* For 82575, context index must be unique per ring. */
+		if (adapter->hw.mac.type == e1000_82575)
+			set_bit(IGB_RING_FLAG_TX_CTX_IDX, &ring->flags);
+
+		/* apply Tx specific ring traits */
+		ring->count = adapter->tx_ring_count;
+		ring->queue_index = txr_idx;
+
+		ring->cbs_enable = false;
+		ring->idleslope = 0;
+		ring->sendslope = 0;
+		ring->hicredit = 0;
+		ring->locredit = 0;
+
+		u64_stats_init(&ring->tx_syncp);
+		u64_stats_init(&ring->tx_syncp2);
+
+		/* assign ring to adapter */
+		adapter->tx_ring[txr_idx] = ring;
+
+		/* push pointer to next ring */
+		ring++;
+	}
+
+	if (rxr_count) {
+		/* assign generic ring traits */
+		ring->dev = &adapter->pdev->dev;
+		ring->netdev = adapter->netdev;
+
+		/* configure backlink on ring */
+		ring->q_vector = q_vector;
+
+		/* update q_vector Rx values */
+		igbk_add_ring(ring, &q_vector->rx);
+
+		/* set flag indicating ring supports SCTP checksum offload */
+		if (adapter->hw.mac.type >= e1000_82576)
+			set_bit(IGB_RING_FLAG_RX_SCTP_CSUM, &ring->flags);
+
+		/* On i350, i354, i210, and i211, loopback VLAN packets
+		 * have the tag byte-swapped.
+		 */
+		if (adapter->hw.mac.type >= e1000_i350)
+			set_bit(IGB_RING_FLAG_RX_LB_VLAN_BSWAP, &ring->flags);
+
+		/* apply Rx specific ring traits */
+		ring->count = adapter->rx_ring_count;
+		ring->queue_index = rxr_idx;
+
+		u64_stats_init(&ring->rx_syncp);
+
+		/* assign ring to adapter */
+		adapter->rx_ring[rxr_idx] = ring;
+	}
+
+	return 0;
+}
+
+static int igbk_alloc_q_vectors(struct igbk_adapter *adapter)
+{
+	int q_vectors = adapter->num_q_vectors;
+	int rxr_remaining = adapter->num_rx_queues;
+	int txr_remaining = adapter->num_tx_queues;
+	int rxr_idx = 0, txr_idx = 0, v_idx = 0;
+	int err;
+
+	if (q_vectors >= (rxr_remaining + txr_remaining)) {
+		for (; rxr_remaining; v_idx++) {
+			err = igbk_alloc_q_vector(adapter, q_vectors, v_idx,
+						 0, 0, 1, rxr_idx);
+
+			if (err)
+				goto err_out;
+
+			/* update counts and index */
+			rxr_remaining--;
+			rxr_idx++;
+		}
+	}
+
+	for (; v_idx < q_vectors; v_idx++) {
+		int rqpv = DIV_ROUND_UP(rxr_remaining, q_vectors - v_idx);
+		int tqpv = DIV_ROUND_UP(txr_remaining, q_vectors - v_idx);
+
+		err = igbk_alloc_q_vector(adapter, q_vectors, v_idx,
+					 tqpv, txr_idx, rqpv, rxr_idx);
+
+		if (err)
+			goto err_out;
+
+		/* update counts and index */
+		rxr_remaining -= rqpv;
+		txr_remaining -= tqpv;
+		rxr_idx++;
+		txr_idx++;
+	}
+
+	return 0;
+
+err_out:
+	adapter->num_tx_queues = 0;
+	adapter->num_rx_queues = 0;
+	adapter->num_q_vectors = 0;
+
+	while (v_idx--)
+		igbk_free_q_vector(adapter, v_idx);
+
+	return -ENOMEM;
+}
+
+static int igbk_tx_map(struct igbk_ring *tx_ring,
+		      struct igbk_tx_buffer *first,
+		      const u8 hdr_len)
+{
+	struct sk_buff *skb = first->skb;
+	struct igbk_tx_buffer *tx_buffer;
+	union e1000_adv_tx_desc *tx_desc;
+	skb_frag_t *frag;
+	dma_addr_t dma;
+	unsigned int data_len, size;
+	u32 tx_flags = first->tx_flags;
+	u32 cmd_type = igbk_tx_cmd_type(skb, tx_flags);
+	u16 i = tx_ring->next_to_use;
+
+	tx_desc = IGBK_TX_DESC(tx_ring, i);
+
+	igbk_tx_olinfo_status(tx_ring, tx_desc, tx_flags, skb->len - hdr_len);
+
+	size = skb_headlen(skb);
+	data_len = skb->data_len;
+
+	dma = dma_map_single(tx_ring->dev, skb->data, size, DMA_TO_DEVICE);
+
+	tx_buffer = first;
+
+	for (frag = &skb_shinfo(skb)->frags[0];; frag++) {
+		if (dma_mapping_error(tx_ring->dev, dma))
+			goto dma_error;
+
+		/* record length, and DMA address */
+		dma_unmap_len_set(tx_buffer, len, size);
+		dma_unmap_addr_set(tx_buffer, dma, dma);
+
+		tx_desc->read.buffer_addr = cpu_to_le64(dma);
+
+		while (unlikely(size > IGBK_MAX_DATA_PER_TXD)) {
+			tx_desc->read.cmd_type_len =
+				cpu_to_le32(cmd_type ^ IGBK_MAX_DATA_PER_TXD);
+
+			i++;
+			tx_desc++;
+			if (i == tx_ring->count) {
+				tx_desc = IGB_TX_DESC(tx_ring, 0);
+				i = 0;
+			}
+			tx_desc->read.olinfo_status = 0;
+
+			dma += IGBK_MAX_DATA_PER_TXD;
+			size -= IGBK_MAX_DATA_PER_TXD;
+
+			tx_desc->read.buffer_addr = cpu_to_le64(dma);
+		}
+
+		if (likely(!data_len))
+			break;
+
+		tx_desc->read.cmd_type_len = cpu_to_le32(cmd_type ^ size);
+
+		i++;
+		tx_desc++;
+		if (i == tx_ring->count) {
+			tx_desc = IGBK_TX_DESC(tx_ring, 0);
+			i = 0;
+		}
+		tx_desc->read.olinfo_status = 0;
+
+		size = skb_frag_size(frag);
+		data_len -= size;
+
+		dma = skb_frag_dma_map(tx_ring->dev, frag, 0,
+				       size, DMA_TO_DEVICE);
+
+		tx_buffer = &tx_ring->tx_buffer_info[i];
+	}
+
+	/* write last descriptor with RS and EOP bits */
+	cmd_type |= size | IGBK_TXD_DCMD;
+	tx_desc->read.cmd_type_len = cpu_to_le32(cmd_type);
+
+	netdev_tx_sent_queue(txring_txq(tx_ring), first->bytecount);
+
+	/* set the timestamp */
+	first->time_stamp = jiffies;
+
+	skb_tx_timestamp(skb);
+
+	/* Force memory writes to complete before letting h/w know there
+	 * are new descriptors to fetch.  (Only applicable for weak-ordered
+	 * memory model archs, such as IA-64).
+	 *
+	 * We also need this memory barrier to make certain all of the
+	 * status bits have been updated before next_to_watch is written.
+	 */
+	dma_wmb();
+
+	/* set next_to_watch value indicating a packet is present */
+	first->next_to_watch = tx_desc;
+
+	i++;
+	if (i == tx_ring->count)
+		i = 0;
+
+	tx_ring->next_to_use = i;
+
+	/* Make sure there is space in the ring for the next send. */
+	igbk_maybe_stop_tx(tx_ring, DESC_NEEDED);
+
+	if (netif_xmit_stopped(txring_txq(tx_ring)) || !netdev_xmit_more()) {
+		writel(i, tx_ring->tail);
+	}
+	return 0;
+
+dma_error:
+	dev_err(tx_ring->dev, "TX DMA map failed\n");
+	tx_buffer = &tx_ring->tx_buffer_info[i];
+
+	/* clear dma mappings for failed tx_buffer_info map */
+	while (tx_buffer != first) {
+		if (dma_unmap_len(tx_buffer, len))
+			dma_unmap_page(tx_ring->dev,
+				       dma_unmap_addr(tx_buffer, dma),
+				       dma_unmap_len(tx_buffer, len),
+				       DMA_TO_DEVICE);
+		dma_unmap_len_set(tx_buffer, len, 0);
+
+		if (i-- == 0)
+			i += tx_ring->count;
+		tx_buffer = &tx_ring->tx_buffer_info[i];
+	}
+
+	if (dma_unmap_len(tx_buffer, len))
+		dma_unmap_single(tx_ring->dev,
+				 dma_unmap_addr(tx_buffer, dma),
+				 dma_unmap_len(tx_buffer, len),
+				 DMA_TO_DEVICE);
+	dma_unmap_len_set(tx_buffer, len, 0);
+
+	dev_kfree_skb_any(tx_buffer->skb);
+	tx_buffer->skb = NULL;
+
+	tx_ring->next_to_use = i;
+
+	return -1;
+}
+
 netdev_tx_t igbk_xmit_frame_ring(struct sk_buff *skb, struct igbk_ring *tx_ring)
 {
 	struct igbk_tx_buffer *first;
@@ -62,12 +566,15 @@ netdev_tx_t igbk_xmit_frame_ring(struct sk_buff *skb, struct igbk_ring *tx_ring)
 	first->tx_flags = tx_flags;
 	first->protocol = protocol;
 
+	/* TODO: add tso later */
+	/*
 	tso = igbk_tso(tx_ring, first, &hdr_len);
 	if (tso < 0)
 		goto out_drop;
 	else if (!tso)
 		igbk_tx_csum(tx_ring, first);
 
+	*/
 	if (igbk_tx_map(tx_ring, first, hdr_len))
 		goto cleanup_tx_tstamp;
 
@@ -77,14 +584,14 @@ out_drop:
 	dev_kfree_skb_any(first->skb);
 	first->skb = NULL;
 cleanup_tx_tstamp:
-	if (unlikely(tx_flags & IGB_TX_FLAGS_TSTAMP)) {
+	if (unlikely(tx_flags & IGBK_TX_FLAGS_TSTAMP)) {
 		struct igbk_adapter *adapter = netdev_priv(tx_ring->netdev);
 
 		dev_kfree_skb_any(adapter->ptp_tx_skb);
 		adapter->ptp_tx_skb = NULL;
 		if (adapter->hw.mac.type == e1000_82576)
 			cancel_work_sync(&adapter->ptp_tx_work);
-		clear_bit_unlock(__IGB_PTP_TX_IN_PROGRESS, &adapter->state);
+		clear_bit_unlock(__IGBK_PTP_TX_IN_PROGRESS, &adapter->state);
 	}
 
 	return NETDEV_TX_OK;

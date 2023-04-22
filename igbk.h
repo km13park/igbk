@@ -200,7 +200,7 @@ struct igbk_ring {
 } ____cacheline_internodealigned_in_smp;
 
 struct igbk_ring_container {
-	struct igb_ring *ring;		/* pointer to linked list of rings */
+	struct igbk_ring *ring;		/* pointer to linked list of rings */
 	unsigned int total_bytes;	/* total bytes processed this int */
 	unsigned int total_packets;	/* total packets processed this int */
 	u16 work_limit;			/* total work allowed per interrupt */
@@ -226,3 +226,12 @@ struct igbk_q_vector {
 	/* for dynamic allocation of rings associated with this q_vector */
 	struct igbk_ring ring[] ____cacheline_internodealigned_in_smp;
 };
+
+/* igbk_desc_unused - calculate if we have unused descriptors */
+static inline int igbk_desc_unused(struct igbk_ring *ring)
+{
+	if (ring->next_to_clean > ring->next_to_use)
+		return ring->next_to_clean - ring->next_to_use - 1;
+
+	return ring->count + ring->next_to_clean - ring->next_to_use - 1;
+}
