@@ -15,6 +15,7 @@
 #include <linux/pci.h>
 #include <linux/aer.h>
 #include "igbk.h"
+#include "e1000_regs.h"
 
 /* Protocol specific headers */
 #include <linux/ip.h>
@@ -31,6 +32,94 @@
 #define IGB_VENDOR_ID		0x8086
 #define IGB_DEVICE_ID		0x10C9
 
+#define IGBK_SET_FLAG(_input, _flag, _result) \
+	((_flag <= _result) ? \
+	 ((u32)(_input & _flag) * (_result / _flag)) : \
+	 ((u32)(_input & _flag) / (_flag / _result)))
+
+static int __igbk_maybe_stop_tx(struct igbk_ring *tx_ring, const u16 size)
+{
+	struct net_device *netdev = tx_ring->netdev;
+
+	netif_stop_subqueue(netdev, tx_ring->queue_index);
+
+	/* Herbert's original patch had:
+	 *  smp_mb__after_netif_stop_queue();
+	 * but since that doesn't exist yet, just open code it.
+	 */
+	smp_mb();
+
+	/* We need to check again in a case another CPU has just
+	 * made room available.
+	 */
+	if (igbk_desc_unused(tx_ring) < size)
+		return -EBUSY;
+
+	/* A reprieve! */
+	netif_wake_subqueue(netdev, tx_ring->queue_index);
+
+	u64_stats_update_begin(&tx_ring->tx_syncp2);
+	tx_ring->tx_stats.restart_queue2++;
+	u64_stats_update_end(&tx_ring->tx_syncp2);
+
+	return 0;
+}
+
+static inline int igbk_maybe_stop_tx(struct igbk_ring *tx_ring, const u16 size)
+{
+	if (igbk_desc_unused(tx_ring) >= size)
+		return 0;
+	return __igbk_maybe_stop_tx(tx_ring, size);
+}
+
+static void igbk_tx_olinfo_status(struct igbk_ring *tx_ring,
+				 union e1000_adv_tx_desc *tx_desc,
+				 u32 tx_flags, unsigned int paylen)
+{
+	u32 olinfo_status = paylen << E1000_ADVTXD_PAYLEN_SHIFT;
+
+	/* 82575 requires a unique index per ring */
+	if (test_bit(IGBK_RING_FLAG_TX_CTX_IDX, &tx_ring->flags))
+		olinfo_status |= tx_ring->reg_idx << 4;
+
+	/* insert L4 checksum */
+	olinfo_status |= IGBK_SET_FLAG(tx_flags,
+				      IGBK_TX_FLAGS_CSUM,
+				      (E1000_TXD_POPTS_TXSM << 8));
+
+	/* insert IPv4 checksum */
+	olinfo_status |= IGBK_SET_FLAG(tx_flags,
+				      IGBK_TX_FLAGS_IPV4,
+				      (E1000_TXD_POPTS_IXSM << 8));
+
+	tx_desc->read.olinfo_status = cpu_to_le32(olinfo_status);
+}
+
+static u32 igbk_tx_cmd_type(struct sk_buff *skb, u32 tx_flags)
+{
+	/* set type for advanced descriptor with frame checksum insertion */
+	u32 cmd_type = E1000_ADVTXD_DTYP_DATA |
+		       E1000_ADVTXD_DCMD_DEXT |
+		       E1000_ADVTXD_DCMD_IFCS;
+
+	/* set HW vlan bit if vlan is present */
+	cmd_type |= IGBK_SET_FLAG(tx_flags, IGBK_TX_FLAGS_VLAN,
+				 (E1000_ADVTXD_DCMD_VLE));
+
+	/* set segmentation bits for TSO */
+	cmd_type |= IGBK_SET_FLAG(tx_flags, IGBK_TX_FLAGS_TSO,
+				 (E1000_ADVTXD_DCMD_TSE));
+
+	/* set timestamp bit if present */
+	cmd_type |= IGBK_SET_FLAG(tx_flags, IGBK_TX_FLAGS_TSTAMP,
+				 (E1000_ADVTXD_MAC_TSTAMP));
+
+	/* insert frame checksum */
+	cmd_type ^= IGBK_SET_FLAG(skb->no_fcs, 1, E1000_ADVTXD_DCMD_IFCS);
+
+	return cmd_type;
+}
+
 static void igbk_ring_irq_enable(struct igbk_q_vector *q_vector)
 {
 	struct igbk_adapter *adapter = q_vector->adapter;
@@ -38,9 +127,27 @@ static void igbk_ring_irq_enable(struct igbk_q_vector *q_vector)
 
 	/* TODO: set the ITR (interrupt throttle rate) here */
 
-	if (!test_bit(__IGB_DOWN, &adapter->state)) {
+	if (!test_bit(__IGBK_DOWN, &adapter->state)) {
 		wr32(E1000_EIMS, q_vector->eims_value);
 	}
+}
+
+static void igbk_free_q_vector(struct igbk_adapter *adapter, int v_idx)
+{
+	struct igbk_q_vector *q_vector = adapter->q_vector[v_idx];
+
+	adapter->q_vector[v_idx] = NULL;
+
+	/* igb_get_stats64() might access the rings on this vector,
+	 * we must wait a grace period before freeing it.
+	 */
+	if (q_vector)
+		kfree_rcu(q_vector, rcu);
+}
+
+static bool igbk_clean_rx_irq(struct igbk_q_vector *q_vector, int napi_budget)
+{
+	return 0;
 }
 
 static bool igbk_clean_tx_irq(struct igbk_q_vector *q_vector, int napi_budget)
@@ -53,11 +160,11 @@ static bool igbk_clean_tx_irq(struct igbk_q_vector *q_vector, int napi_budget)
 	unsigned int budget = q_vector->tx.work_limit;
 	unsigned int i = tx_ring->next_to_clean;
 
-	if (test_bit(__IGB_DOWN, &adapter->state))
+	if (test_bit(__IGBK_DOWN, &adapter->state))
 		return true;
 
 	tx_buffer = &tx_ring->tx_buffer_info[i];
-	tx_desc = IGB_TX_DESC(tx_ring, i);
+	tx_desc = IGBK_TX_DESC(tx_ring, i);
 	i -= tx_ring->count;
 
 	do {
@@ -82,10 +189,7 @@ static bool igbk_clean_tx_irq(struct igbk_q_vector *q_vector, int napi_budget)
 		total_packets += tx_buffer->gso_segs;
 
 		/* free the skb */
-		if (tx_buffer->type == IGB_TYPE_SKB)
-			napi_consume_skb(tx_buffer->skb, napi_budget);
-		else
-			xdp_return_frame(tx_buffer->xdpf);
+		napi_consume_skb(tx_buffer->skb, napi_budget);
 
 		/* unmap skb header data */
 		dma_unmap_single(tx_ring->dev,
@@ -104,7 +208,7 @@ static bool igbk_clean_tx_irq(struct igbk_q_vector *q_vector, int napi_budget)
 			if (unlikely(!i)) {
 				i -= tx_ring->count;
 				tx_buffer = tx_ring->tx_buffer_info;
-				tx_desc = IGB_TX_DESC(tx_ring, 0);
+				tx_desc = IGBK_TX_DESC(tx_ring, 0);
 			}
 
 			/* unmap any remaining paged data */
@@ -124,7 +228,7 @@ static bool igbk_clean_tx_irq(struct igbk_q_vector *q_vector, int napi_budget)
 		if (unlikely(!i)) {
 			i -= tx_ring->count;
 			tx_buffer = tx_ring->tx_buffer_info;
-			tx_desc = IGB_TX_DESC(tx_ring, 0);
+			tx_desc = IGBK_TX_DESC(tx_ring, 0);
 		}
 
 		/* issue prefetch for next Tx descriptor */
@@ -171,7 +275,7 @@ static bool igbk_clean_tx_irq(struct igbk_q_vector *q_vector, int napi_budget)
 static int igbk_poll(struct napi_struct *napi, int budget)
 {
 	struct igbk_q_vector *q_vector = container_of(napi,
-						     struct igb_q_vector,
+						     struct igbk_q_vector,
 						     napi);
 	bool clean_complete = true;
 	int work_done = 0;
@@ -222,7 +326,7 @@ static int igbk_alloc_q_vector(struct igbk_adapter *adapter,
 		return -ENOMEM;
 
 	ring_count = txr_count + rxr_count;
-	size = kmalloc_size_roundup(struct_size(q_vector, ring, ring_count));
+	size = struct_size(q_vector, ring, ring_count);
 
 	/* allocate q_vector and rings */
 	q_vector = adapter->q_vector[v_idx];
@@ -242,7 +346,7 @@ static int igbk_alloc_q_vector(struct igbk_adapter *adapter,
 		return -ENOMEM;
 
 	/* initialize NAPI */
-	netif_napi_add(adapter->netdev, &q_vector->napi, igbk_poll);
+	netif_napi_add(adapter->netdev, &q_vector->napi, igbk_poll, 64);
 
 	/* tie q_vector and adapter together */
 	adapter->q_vector[v_idx] = q_vector;
@@ -252,8 +356,8 @@ static int igbk_alloc_q_vector(struct igbk_adapter *adapter,
 	q_vector->tx.work_limit = adapter->tx_work_limit;
 
 	/* initialize ITR configuration */
-	q_vector->itr_register = adapter->io_addr + E1000_EITR(0);
-	q_vector->itr_val = IGB_START_ITR;
+	q_vector->itr_register = adapter->ioaddr + E1000_EITR(0);
+	q_vector->itr_val = IGBK_START_ITR;
 
 	/* initialize pointer to rings */
 	ring = q_vector->ring;
@@ -279,10 +383,6 @@ static int igbk_alloc_q_vector(struct igbk_adapter *adapter,
 
 		/* update q_vector Tx values */
 		igbk_add_ring(ring, &q_vector->tx);
-
-		/* For 82575, context index must be unique per ring. */
-		if (adapter->hw.mac.type == e1000_82575)
-			set_bit(IGB_RING_FLAG_TX_CTX_IDX, &ring->flags);
 
 		/* apply Tx specific ring traits */
 		ring->count = adapter->tx_ring_count;
@@ -316,14 +416,12 @@ static int igbk_alloc_q_vector(struct igbk_adapter *adapter,
 		igbk_add_ring(ring, &q_vector->rx);
 
 		/* set flag indicating ring supports SCTP checksum offload */
-		if (adapter->hw.mac.type >= e1000_82576)
-			set_bit(IGB_RING_FLAG_RX_SCTP_CSUM, &ring->flags);
+		//set_bit(IGBK_RING_FLAG_RX_SCTP_CSUM, &ring->flags);
 
 		/* On i350, i354, i210, and i211, loopback VLAN packets
 		 * have the tag byte-swapped.
 		 */
-		if (adapter->hw.mac.type >= e1000_i350)
-			set_bit(IGB_RING_FLAG_RX_LB_VLAN_BSWAP, &ring->flags);
+		//set_bit(IGB_RING_FLAG_RX_LB_VLAN_BSWAP, &ring->flags);
 
 		/* apply Rx specific ring traits */
 		ring->count = adapter->rx_ring_count;
@@ -432,7 +530,7 @@ static int igbk_tx_map(struct igbk_ring *tx_ring,
 			i++;
 			tx_desc++;
 			if (i == tx_ring->count) {
-				tx_desc = IGB_TX_DESC(tx_ring, 0);
+				tx_desc = IGBK_TX_DESC(tx_ring, 0);
 				i = 0;
 			}
 			tx_desc->read.olinfo_status = 0;
@@ -557,7 +655,6 @@ netdev_tx_t igbk_xmit_frame_ring(struct sk_buff *skb, struct igbk_ring *tx_ring)
 
 	/* record the location of the first descriptor for this packet */
 	first = &tx_ring->tx_buffer_info[tx_ring->next_to_use];
-	first->type = IGB_TYPE_SKB;
 	first->skb = skb;
 	first->bytecount = skb->len;
 	first->gso_segs = 1;
@@ -589,8 +686,7 @@ cleanup_tx_tstamp:
 
 		dev_kfree_skb_any(adapter->ptp_tx_skb);
 		adapter->ptp_tx_skb = NULL;
-		if (adapter->hw.mac.type == e1000_82576)
-			cancel_work_sync(&adapter->ptp_tx_work);
+		cancel_work_sync(&adapter->ptp_tx_work);
 		clear_bit_unlock(__IGBK_PTP_TX_IN_PROGRESS, &adapter->state);
 	}
 

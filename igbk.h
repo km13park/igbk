@@ -1,8 +1,18 @@
 #include <linux/pci.h>
 #include <linux/if_vlan.h>
+#include "e1000_regs.h"
 
-#define MAX_MSIX_ENTRIES 10
+#define MAX_MSIX_ENTRIES 	10
 #define MAX_Q_VECTORS		8
+#define IGBK_MAX_TXD_PWR	15
+#define IGBK_MAX_DATA_PER_TXD	(1u << IGBK_MAX_TXD_PWR)
+
+enum e1000_state_t {
+	__IGBK_TESTING,
+	__IGBK_RESETTING,
+	__IGBK_DOWN,
+	__IGBK_PTP_TX_IN_PROGRESS,
+};
 
 enum e1000_bus_type {
 	e1000_bus_type_unknown = 0,
@@ -72,23 +82,23 @@ union e1000_adv_tx_desc {
 	struct {
 		__le64 rsvd;       /* Reserved */
 		__le32 nxtseq_seed;
-		__le32 status;e1000_adv_tx_desc
+		__le32 status;
 	} wb;
 };
 
 /* wrapper around a pointer to a socket buffer,
  * so a DMA handle can be stored along with the buffer
  */
-struct igb_tx_buffer {
-	union  *next_to_watch;
+struct igbk_tx_buffer {
+	union e1000_adv_tx_desc *next_to_watch;
 	unsigned long time_stamp;
 	struct sk_buff *skb;
 	unsigned int bytecount;
 	u16 gso_segs;
 	__be16 protocol;
 
-	//DEFINE_DMA_UNMAP_ADDR(dma);
-	//DEFINE_DMA_UNMAP_LEN(len);
+	DEFINE_DMA_UNMAP_ADDR(dma);
+	DEFINE_DMA_UNMAP_LEN(len);
 	u32 tx_flags;
 };
 
@@ -121,11 +131,14 @@ struct igbk_adapter {
 	u16 tx_ring_count;
 	u16 rx_ring_count;
 
+	struct work_struct ptp_tx_work;
+
 	u32 max_frame_size;
 	u32 min_frame_size;
 
 	struct igbk_q_vector *q_vector[MAX_Q_VECTORS];
 	struct e1000_hw hw;
+	struct sk_buff *ptp_tx_skb;
 };
 
 /* TX/RX descriptor defines */
@@ -136,6 +149,7 @@ struct igbk_adapter {
 #define IGBK_ETH_PKT_HDR_PAD	(ETH_HLEN + ETH_FCS_LEN + (VLAN_HLEN * 2))
 #define IGBK_FLAG_HAS_MSIX		BIT(13)
 #define MAX_MSIX_ENTRIES	10
+#define IGBK_TXD_DCMD (E1000_ADVTXD_DCMD_EOP | E1000_ADVTXD_DCMD_RS)
 
 struct igbk_tx_queue_stats {
 	u64 packets;
@@ -235,3 +249,41 @@ static inline int igbk_desc_unused(struct igbk_ring *ring)
 
 	return ring->count + ring->next_to_clean - ring->next_to_use - 1;
 }
+
+#define wr32(reg, val) \
+do { \
+	u8 __iomem *hw_addr = READ_ONCE((hw)->hw_addr); \
+	if (!hw_addr) \
+		writel((val), &hw_addr[(reg)]); \
+} while (0)
+
+#define IGBK_TX_DESC(R, i)	\
+	(&(((union e1000_adv_tx_desc *)((R)->desc))[i]))
+
+static inline struct netdev_queue *txring_txq(const struct igbk_ring *tx_ring)
+{
+	return netdev_get_tx_queue(tx_ring->netdev, tx_ring->queue_index);
+}
+
+#define DESC_NEEDED (MAX_SKB_FRAGS + 4)
+#define IGBK_START_ITR		648 /* ~6000 ints/sec */
+#define TXD_USE_COUNT(S) DIV_ROUND_UP((S), IGBK_MAX_DATA_PER_TXD)
+
+enum igbk_tx_flags {
+	/* cmd_type flags */
+	IGBK_TX_FLAGS_VLAN	= 0x01,
+	IGBK_TX_FLAGS_TSO	= 0x02,
+	IGBK_TX_FLAGS_TSTAMP	= 0x04,
+
+	/* olinfo flags */
+	IGBK_TX_FLAGS_IPV4	= 0x10,
+	IGBK_TX_FLAGS_CSUM	= 0x20,
+};
+enum e1000_ring_flags_t {
+	IGBK_RING_FLAG_RX_3K_BUFFER,
+	IGBK_RING_FLAG_RX_BUILD_SKB_ENABLED,
+	IGBK_RING_FLAG_RX_SCTP_CSUM,
+	IGBK_RING_FLAG_RX_LB_VLAN_BSWAP,
+	IGBK_RING_FLAG_TX_CTX_IDX,
+	IGBK_RING_FLAG_TX_DETECT_HANG
+};
