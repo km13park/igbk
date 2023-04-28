@@ -147,7 +147,110 @@ static void igbk_free_q_vector(struct igbk_adapter *adapter, int v_idx)
 
 static bool igbk_clean_rx_irq(struct igbk_q_vector *q_vector, int napi_budget)
 {
-	return 0;
+	struct igb_adapter *adapter = q_vector->adapter;
+	struct igb_ring *rx_ring = q_vector->rx.ring;
+	struct sk_buff *skb = rx_ring->skb;
+	unsigned int total_bytes = 0, total_packets = 0;
+	u16 cleaned_count = igb_desc_unused(rx_ring);
+	u32 frame_sz = 0;
+	int rx_buf_pgcnt;
+
+	/* Frame size depend on rx_ring setup when PAGE_SIZE=4K */
+#if (PAGE_SIZE < 8192)
+	frame_sz = igb_rx_frame_truesize(rx_ring, 0);
+#endif
+
+	while (likely(total_packets < budget)) {
+		union e1000_adv_rx_desc *rx_desc;
+		struct igb_rx_buffer *rx_buffer;
+		ktime_t timestamp = 0;
+		int pkt_offset = 0;
+		unsigned int size;
+		void *pktbuf;
+
+		/* return some buffers to hardware, one at a time is too slow */
+		if (cleaned_count >= IGB_RX_BUFFER_WRITE) {
+			igb_alloc_rx_buffers(rx_ring, cleaned_count);
+			cleaned_count = 0;
+		}
+
+		rx_desc = IGB_RX_DESC(rx_ring, rx_ring->next_to_clean);
+		size = le16_to_cpu(rx_desc->wb.upper.length);
+		if (!size)
+			break;
+
+		/* This memory barrier is needed to keep us from reading
+		 * any other fields out of the rx_desc until we know the
+		 * descriptor has been written back
+		 */
+		dma_rmb();
+
+		rx_buffer = igb_get_rx_buffer(rx_ring, size, &rx_buf_pgcnt);
+		pktbuf = page_address(rx_buffer->page) + rx_buffer->page_offset;
+
+		/* pull rx packet timestamp if available and valid */
+		if (igb_test_staterr(rx_desc, E1000_RXDADV_STAT_TSIP)) {
+			int ts_hdr_len;
+
+			ts_hdr_len = igb_ptp_rx_pktstamp(rx_ring->q_vector,
+							 pktbuf, &timestamp);
+
+			pkt_offset += ts_hdr_len;
+			size -= ts_hdr_len;
+		}
+
+		if (skb)
+			igb_add_rx_frag(rx_ring, rx_buffer, skb, size);
+
+		/* exit if we failed to retrieve a buffer */
+		if (!skb) {
+			rx_ring->rx_stats.alloc_failed++;
+			rx_buffer->pagecnt_bias++;
+			break;
+		}
+
+		igb_put_rx_buffer(rx_ring, rx_buffer, rx_buf_pgcnt);
+		cleaned_count++;
+
+		/* fetch next buffer in frame if non-eop */
+		if (igb_is_non_eop(rx_ring, rx_desc))
+			continue;
+
+		/* verify the packet layout is correct */
+		if (igb_cleanup_headers(rx_ring, rx_desc, skb)) {
+			skb = NULL;
+			continue;
+		}
+
+		/* probably a little skewed due to removing CRC */
+		total_bytes += skb->len;
+
+		/* populate checksum, timestamp, VLAN, and protocol */
+		igb_process_skb_fields(rx_ring, rx_desc, skb);
+
+		napi_gro_receive(&q_vector->napi, skb);
+
+		/* reset skb pointer */
+		skb = NULL;
+
+		/* update budget accounting */
+		total_packets++;
+	}
+
+	/* place incomplete frames back on ring for completion */
+	rx_ring->skb = skb;
+
+	u64_stats_update_begin(&rx_ring->rx_syncp);
+	rx_ring->rx_stats.packets += total_packets;
+	rx_ring->rx_stats.bytes += total_bytes;
+	u64_stats_update_end(&rx_ring->rx_syncp);
+	q_vector->rx.total_packets += total_packets;
+	q_vector->rx.total_bytes += total_bytes;
+
+	if (cleaned_count)
+		igb_alloc_rx_buffers(rx_ring, cleaned_count);
+
+	return total_packets;
 }
 
 static bool igbk_clean_tx_irq(struct igbk_q_vector *q_vector, int napi_budget)
