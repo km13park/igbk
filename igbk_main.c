@@ -776,7 +776,110 @@ free:
 }
 
 static void igbk_tx(struct sk_buff *skb){}
-static int igbk_init_interrupt_scheme(struct igbk_adapter *adapter, bool msix){return 0;}
+
+static void igbk_reset_q_vector(struct igbk_adapter *adapter, int v_idx)
+{
+	struct igbk_q_vector *q_vector = adapter->q_vector[v_idx];
+
+	/* Coming from igb_set_interrupt_capability, the vectors are not yet
+	 * allocated. So, q_vector is NULL so we should stop here.
+	 */
+	if (!q_vector)
+		return;
+
+	if (q_vector->tx.ring)
+		adapter->tx_ring[q_vector->tx.ring->queue_index] = NULL;
+
+	if (q_vector->rx.ring)
+		adapter->rx_ring[q_vector->rx.ring->queue_index] = NULL;
+
+	netif_napi_del(&q_vector->napi);
+
+}
+
+static void igbk_reset_interrupt_capability(struct igbk_adapter *adapter)
+{
+	int v_idx = adapter->num_q_vectors;
+
+	if (adapter->flags & IGBK_FLAG_HAS_MSIX)
+		pci_disable_msix(adapter->pdev);
+	else if (adapter->flags & IGBK_FLAG_HAS_MSI)
+		pci_disable_msi(adapter->pdev);
+
+	while (v_idx--)
+		igbk_reset_q_vector(adapter, v_idx);
+}
+
+static void igbk_set_interrupt_capability(struct igbk_adapter *adapter, bool msix)
+{
+	int err;
+	int numvecs, i;
+
+	if (!msix)
+		goto msi_only;
+	adapter->flags |= IGBK_FLAG_HAS_MSIX;
+
+	/* Number of supported queues. */
+	adapter->num_rx_queues = adapter->rss_queues;
+
+	/* start with one vector for every Rx queue */
+	numvecs = adapter->num_rx_queues;
+
+	/* if Tx handler is separate add 1 for every Tx queue */
+	if (!(adapter->flags & IGBK_FLAG_QUEUE_PAIRS))
+		numvecs += adapter->num_tx_queues;
+
+	/* store the number of vectors reserved for queues */
+	adapter->num_q_vectors = numvecs;
+
+	/* add 1 vector for link status interrupts */
+	numvecs++;
+	for (i = 0; i < numvecs; i++)
+		adapter->msix_entries[i].entry = i;
+
+	err = pci_enable_msix_range(adapter->pdev,
+				    adapter->msix_entries,
+				    numvecs,
+				    numvecs);
+	/* if pci_enable_msix_range succeeds, it returns the number of interrupts allocated */
+	if (err > 0)
+		return;
+
+	igbk_reset_interrupt_capability(adapter);
+
+	/* If we can't do MSI-X, try MSI */
+msi_only:
+	adapter->flags &= ~IGB_FLAG_HAS_MSIX;
+	adapter->vfs_allocated_count = 0;
+	adapter->rss_queues = 1;
+	adapter->flags |= IGB_FLAG_QUEUE_PAIRS;
+	adapter->num_rx_queues = 1;
+	adapter->num_tx_queues = 1;
+	adapter->num_q_vectors = 1;
+	if (!pci_enable_msi(adapter->pdev))
+		adapter->flags |= IGB_FLAG_HAS_MSI;
+}
+
+static int igbk_init_interrupt_scheme(struct igbk_adapter *adapter, bool msix)
+{
+	struct pci_dev *pdev = adapter->pdev;
+	int err;
+
+	igbk_set_interrupt_capability(adapter, msix);
+
+	err = igbk_alloc_q_vectors(adapter);
+	if (err) {
+		dev_err(&pdev->dev, "Unable to allocate memory for vectors\n");
+		goto err_alloc_q_vectors;
+	}
+
+	return 0;
+
+err_alloc_q_vectors:
+	igbk_reset_interrupt_capability(adapter);
+	return err;
+}
+
 static void igbk_irq_disable(struct igbk_adapter *adapter){}
 
 static netdev_tx_t igbk_xmit(struct sk_buff *skb, struct net_device *dev)
